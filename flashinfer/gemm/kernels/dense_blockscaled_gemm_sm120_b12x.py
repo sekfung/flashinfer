@@ -281,15 +281,21 @@ class DenseGemmKernel:
         self.mma_register_requirement = 232
 
     def _setup_attributes(self):
-        # FP4-only target (NVF4 sf_vec_size=16 / MXF4 sf_vec_size=32). The MXFP8
-        # warp-MMA path was dropped: FlashInfer only drives this kernel for FP4,
-        # and cute.nvgpu.warp.MmaMXF8Op is absent in the public cutlass-dsl build.
-        mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
-            self.a_dtype,
-            self.acc_dtype,
-            self.sf_dtype,
-        )
-        atom_shape = self.atom_shape
+        # sf_vec_size==32 -> MXF4 atom (E8M0 32-block); else NVF4 (E4M3 16-block).
+        # Both share MMA shape (16,8,64); only sf_vec_size/sf_type differ.
+        if self.sf_vec_size == 32:
+            mma_op = cute.nvgpu.warp.MmaMXF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+        else:
+            mma_op = cute.nvgpu.warp.MmaMXF4NVF4Op(
+                self.a_dtype,
+                self.acc_dtype,
+                self.sf_dtype,
+            )
+        atom_shape = (4, 2, 1)
         atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
             self.mma_tile_shape_mnk,
@@ -546,6 +552,12 @@ class DenseGemmKernel:
         thr_vmk = (thr_vmnk[0], (thr_vmnk[1], thr_vmnk[3]))
         partitioned_sfa = thr_tensor[thr_vmk, (None, None)]
         partitioned_sfa = cute.group_modes(cute.flatten(partitioned_sfa), 0, 2)
+        # sf_vec_size=32 (MXF4, mma_nsf=2) leaves a rank-4 fragment; collapse the
+        # trailing K-modes to rank-3 (mode[2] == num_k_blocks). No-op for NVF4.
+        if cute.rank(partitioned_sfa) > 3:
+            partitioned_sfa = cute.group_modes(
+                partitioned_sfa, 2, cute.rank(partitioned_sfa)
+            )
         return cute.make_fragment_like(partitioned_sfa)
 
     def _partition_fragment_SFB(
@@ -561,6 +573,12 @@ class DenseGemmKernel:
         partitioned_sfb = thr_tensor[thr_vnk, (None, None)]
         partitioned_sfb = cute.group_modes(cute.flatten(partitioned_sfb), 0, 2)
         partitioned_sfb = cute.group_modes(partitioned_sfb, 1, 3)
+        # See _partition_fragment_SFA: collapse extra trailing K-modes for
+        # sf_vec_size=32 so the fragment is rank-3 (mode[2] == num_k_blocks).
+        if cute.rank(partitioned_sfb) > 3:
+            partitioned_sfb = cute.group_modes(
+                partitioned_sfb, 2, cute.rank(partitioned_sfb)
+            )
         return cute.make_fragment_like(partitioned_sfb)
 
     def _thrfrg_SFA(self, sfa_tensor, tiled_mma: cute.TiledMma):
@@ -2380,32 +2398,17 @@ class DenseGemmKernel:
             return False
         if load_path not in _DENSE_LOAD_PATHS:
             return False
-        # FP4-only target (NVF4/MXF4). The MXFP8 warp-MMA path was dropped.
+        # The current target only supports FP4 (MmaMXF4NVF4Op / MmaMXF4Op)
         if ab_dtype != cutlass.Float4E2M1FN:
             return False
-        if swap_ab:
-            if l != 1:
+        # Two valid block-scaled FP4 configs: (16, E4M3) NVF4 / (32, E8M0) MXF4.
+        if sf_vec_size == 16:
+            if sf_dtype != cutlass.Float8E4M3FN:
                 return False
-            if sf_vec_size != 16:
+        elif sf_vec_size == 32:
+            if sf_dtype != cutlass.Float8E8M0FNU:
                 return False
-        if load_path == "cpasync" and (sf_vec_size != 16 or l != 1):
-            return False
-        # FP4 experiments allow narrow N tiles. The scale-factor smem paths
-        # still allocate full 128-element SF blocks, but the live MMA tile may
-        # consume only 16/32 columns.
-        if (
-            mma_tiler_mn[0] % 64 != 0
-            or mma_tiler_mn[1] % 16 != 0
-            or mma_tiler_mn[1] > 128
-            or (mma_tiler_mn[1] < 64 and not swap_ab)
-        ):
-            return False
-        # Current target MMA constraints:
-        #   sf_vec_size=16 requires sf_dtype=Float8E4M3FN
-        #   sf_vec_size=32 requires sf_dtype=Float8E8M0FNU
-        if sf_vec_size == 16 and sf_dtype != cutlass.Float8E4M3FN:
-            return False
-        if sf_vec_size == 32 and sf_dtype != cutlass.Float8E8M0FNU:
+        else:
             return False
         # Public output is 16-bit; split-K internally uses FP32 partial output.
         if c_dtype not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32):
