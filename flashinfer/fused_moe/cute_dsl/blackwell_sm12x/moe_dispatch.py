@@ -2482,8 +2482,17 @@ def launch_sm120_moe(
         )
 
     if fc2_input_scale is None:
-        raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
-    down_input_scale = fc2_input_scale
+        if quant_mode == "mxfp4":
+            # MXFP4 is self-scaling (32-element E8M0 blocks); the FC2-input
+            # requant in the epilogue ignores the global scale (the kernel skips
+            # the gs load for sf_vec_size==32). Supply a unit placeholder so the
+            # kernel argument stays a valid tensor without forcing callers
+            # (e.g. SGLang) to fabricate an unused scale.
+            down_input_scale = torch.ones(1, dtype=torch.float32, device=a.device)
+        else:
+            raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
+    else:
+        down_input_scale = fc2_input_scale
 
     weights = (
         _weight_views

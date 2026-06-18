@@ -1047,6 +1047,222 @@ def create_relu2_moe_tensors(
 # =============================================================================
 
 
+def _mxfp4_quantize_grouped_weight(w_bf16, num_groups, m, k):
+    """Quantize a grouped weight ``[G, m, k]`` (bf16) to MXFP4.
+
+    Returns ``(w_q [G, m, k//2] fp4x2, w_sf_mma)`` where the scale factors are
+    32-element UE8M0 blocks in the 6D MMA layout the b12x kernel consumes.
+    Mirrors the NVFP4 weight prep in ``create_moe_tensors`` but with
+    ``sf_vec_size=32`` / ``sf_use_ue8m0=True`` (self-scaling, so alpha == 1.0).
+    """
+    from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+    gs = torch.tensor([1.0], device=w_bf16.device, dtype=torch.float32)
+    w_flat = w_bf16.reshape(num_groups * m, k)
+    w_q_flat, w_sf_flat = fp4_quantize(
+        w_flat,
+        global_scale=gs,
+        sf_vec_size=32,
+        sf_use_ue8m0=True,
+        is_sf_swizzled_layout=True,
+    )
+    w_q = w_q_flat.view(num_groups, m, k // 2)
+    w_sf_mma = convert_sf_to_mma_layout(
+        w_sf_flat, m=m, k=k, num_groups=num_groups, sf_vec_size=32
+    )
+    return w_q, w_sf_mma
+
+
+def create_mxfp4_moe_tensors(
+    num_tokens, hidden_size, intermediate_size, num_experts, num_local_experts, top_k,
+    *, gated=True, device="cuda", seed=42,
+):
+    """MXFP4 analog of ``create_moe_tensors`` / ``create_relu2_moe_tensors``.
+
+    ``gated=True`` builds SiLU SwiGLU FC1 weights ``[E, 2*inter, hidden]``
+    (b12x expects the non-interleaved ``[up | gate]`` cat on SM120); ``gated=False``
+    builds the non-gated ReLU2 FC1 ``[E, inter, hidden]``. Activations stay bf16 —
+    the kernel quantizes them internally with the 32-element E8M0 recipe.
+    """
+    torch.manual_seed(seed)
+    w1_rows = (2 * intermediate_size) if gated else intermediate_size
+
+    x_bf16 = (
+        torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 10
+    )
+
+    router_logits = torch.randn(num_tokens, num_experts, device=device)
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    routing_weights = (routing_weights / routing_weights.sum(dim=-1, keepdim=True)).float()
+    selected_experts = selected_experts.to(torch.int32)
+
+    w1_bf16 = (
+        torch.randn(
+            num_local_experts, w1_rows, hidden_size, dtype=torch.bfloat16, device=device
+        )
+        / 10
+    )
+    w1_q, w1_weight_sf = _mxfp4_quantize_grouped_weight(
+        w1_bf16, num_local_experts, w1_rows, hidden_size
+    )
+
+    w2_bf16 = (
+        torch.randn(
+            num_local_experts, hidden_size, intermediate_size,
+            dtype=torch.bfloat16, device=device,
+        )
+        / 10
+    )
+    w2_q, w2_weight_sf = _mxfp4_quantize_grouped_weight(
+        w2_bf16, num_local_experts, hidden_size, intermediate_size
+    )
+
+    ones = lambda: torch.ones(num_local_experts, device=device, dtype=torch.float32)
+    return {
+        "x_bf16": x_bf16,
+        "token_selected_experts": selected_experts,
+        "token_final_scales": routing_weights,
+        "w1_weight": w1_q,
+        "w1_weight_sf": w1_weight_sf,
+        "w1_weight_bf16": w1_bf16,
+        "w1_alpha": ones(),  # self-scaling MXFP4: no global dequant scale
+        "fc2_input_scale": None,
+        "w2_weight": w2_q,
+        "w2_weight_sf": w2_weight_sf,
+        "w2_weight_bf16": w2_bf16,
+        "w2_alpha": ones(),
+    }
+
+
+@cute_dsl_available
+@sm120_required
+@cuda_13_required
+class TestB12xMXFP4Functional:
+    """End-to-end accuracy + backend coverage for ``quant_mode='mxfp4'``.
+
+    The MXFP4 fused-MoE kernels (32-element E8M0 self-scaling, no global scale)
+    share routing/tiling with NVFP4 but carry their own quant/scatter/swizzle in
+    the prologue and the fused FC1->FC2 epilogue. This is the only end-to-end
+    numerical coverage for that path; the dense GEMM mxfp4 test does not exercise
+    the MoE scatter or the intermediate requant.
+    """
+
+    @pytest.mark.parametrize(
+        "num_tokens,top_k,expected_backend,expect_micro",
+        [
+            (8, 1, "static", True),    # routed=8  <= micro cutover (20)
+            (128, 1, "static", False), # routed=128 -> plain static
+            (768, 1, "dynamic", False),# routed=768 > static cutover (640)
+            (256, 6, "dynamic", False),# DeepSeek-V4-Flash top_k=6 -> dynamic
+        ],
+    )
+    def test_mxfp4_backend_selection(
+        self, num_tokens, top_k, expected_backend, expect_micro
+    ):
+        """Pin which dispatch path each routed-row count exercises (no GPU run)."""
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+            select_sm120_moe_backend,
+            _MICRO_COMPACT_CUTOVER_PAIRS,
+            _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK,
+        )
+
+        backend = select_sm120_moe_backend(
+            num_tokens=num_tokens, num_topk=top_k, quant_mode="mxfp4"
+        )
+        assert backend == expected_backend
+        routed = num_tokens * top_k
+        micro_cutover = (
+            _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK
+            if top_k > 1
+            else _MICRO_COMPACT_CUTOVER_PAIRS
+        )
+        assert (backend == "static" and routed <= micro_cutover) == expect_micro
+
+    @pytest.mark.parametrize("activation", ["silu", "relu2"])
+    @pytest.mark.parametrize(
+        "num_tokens,top_k", [(8, 1), (128, 1), (768, 1)]
+    )
+    def test_mxfp4_numerical_accuracy(self, activation, num_tokens, top_k):
+        """MXFP4 fused MoE vs full-precision reference across micro/static/dynamic.
+
+        Reference uses the un-quantized bf16 weights; ``check_accuracy`` absorbs
+        FP4 weight-quant noise and the kernel's internal MXFP4 requant of the FC1
+        output (which the reference does not model, fc2_input_scale=None).
+        """
+        from flashinfer import b12x_fused_moe
+
+        hidden_size, intermediate_size = 512, 1024
+        num_experts = num_local_experts = 8
+        gated = activation == "silu"
+
+        tensors = create_mxfp4_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            top_k=top_k,
+            gated=gated,
+        )
+
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            quant_mode="mxfp4",
+            activation=activation,
+        )
+
+        assert result.shape == (num_tokens, hidden_size)
+        assert result.dtype == torch.bfloat16
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+        ref_kwargs = dict(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_local_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=None,
+        )
+        if gated:
+            ref_output = compute_reference_moe_fp4(
+                gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                **ref_kwargs,
+            )
+        else:
+            ref_output = compute_reference_moe_relu2(
+                fc1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                fc2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                **ref_kwargs,
+            )
+
+        ok, percent, atol = check_accuracy(
+            result.float(), ref_output, percent_threshold=0.95
+        )
+        assert ok, (
+            f"MXFP4 {activation} accuracy {percent:.3f} below threshold "
+            f"(atol={atol:.4f}, num_tokens={num_tokens}, top_k={top_k})"
+        )
+
+
 @cute_dsl_available
 @sm120_required
 @cuda_13_required

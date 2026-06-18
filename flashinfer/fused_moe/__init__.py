@@ -86,6 +86,7 @@ try:
         CuteDslMoEWrapper,
         b12x_fused_moe,
         B12xMoEWrapper,
+        sm120_moe_supported_quant_modes,
     )
 
     _cute_dsl_available = True
@@ -153,4 +154,5 @@ if _cute_dsl_available:
         "CuteDslMoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
+        "sm120_moe_supported_quant_modes",
     ]

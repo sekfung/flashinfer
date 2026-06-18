@@ -112,8 +112,8 @@ def b12x_fused_moe(
         Per-expert global scale for FC2.
     fc2_input_scale : Optional[torch.Tensor]
         Global scale for FC2 input quantization.  Required for
-        ``quant_mode="nvfp4"``; accepted but ignored for
-        ``quant_mode="w4a16"``.
+        ``quant_mode="nvfp4"``; accepted but ignored for ``"mxfp4"`` (the
+        32-element E8M0 blocks are self-scaling) and ``"w4a16"``.
     num_local_experts : Optional[int]
         Local experts for expert parallelism.  Defaults to ``num_experts``.
     output : Optional[torch.Tensor]
@@ -128,8 +128,12 @@ def b12x_fused_moe(
         Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
         ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
     quant_mode : Optional[str]
-        Quantization mode, ``"nvfp4"`` / ``"w4a4"`` or ``"w4a16"``.  When set,
-        selects the backend and internal workspace family.
+        Quantization mode: ``"nvfp4"`` / ``"w4a4"`` / ``"fp4"`` (NVFP4, 16-element
+        E4M3 block scales), ``"mxfp4"`` (MXFP4, 32-element UE8M0 self-scaling
+        blocks — no global scale or ``fc2_input_scale`` needed), or ``"w4a16"`` /
+        ``"bf16"`` (BF16 activations).  When set, selects the backend and internal
+        workspace family.  See :func:`sm120_moe_supported_quant_modes` for the
+        full set of accepted names.
     source_format : str
         Source weight format for ``quant_mode="w4a16"`` — ``"modelopt"`` or
         ``"compressed_tensors"``.  Defaults to ``"modelopt"``.
@@ -293,7 +297,8 @@ class B12xMoEWrapper:
             Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
             ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
         quant_mode : Optional[str]
-            Quantization mode, ``"nvfp4"`` / ``"w4a4"`` or ``"w4a16"``.
+            Quantization mode: ``"nvfp4"`` / ``"w4a4"`` / ``"fp4"``, ``"mxfp4"``
+            (32-element UE8M0 self-scaling), or ``"w4a16"`` / ``"bf16"``.
         source_format : str
             Source weight format for ``quant_mode="w4a16"`` —
             ``"modelopt"`` (default) or ``"compressed_tensors"``.

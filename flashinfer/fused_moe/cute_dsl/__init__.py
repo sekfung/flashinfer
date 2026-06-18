@@ -27,6 +27,9 @@ if is_cute_dsl_available():
         b12x_fused_moe,
         B12xMoEWrapper,
     )
+    from .blackwell_sm12x import (
+        sm120_moe_supported_quant_modes,
+    )
 
 __all__ = [
     "is_cute_dsl_available",
@@ -38,4 +41,5 @@ if is_cute_dsl_available():
         "CuteDslMoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
+        "sm120_moe_supported_quant_modes",
     ]
