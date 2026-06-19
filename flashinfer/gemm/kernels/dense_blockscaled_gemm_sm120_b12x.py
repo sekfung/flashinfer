@@ -281,9 +281,9 @@ class DenseGemmKernel:
         self.mma_register_requirement = 232
 
     def _setup_attributes(self):
-        # sf_vec_size==32 -> MXF4 atom (E8M0 32-block); else NVF4 (E4M3 16-block).
-        # Both share MMA shape (16,8,64); only sf_vec_size/sf_type differ.
-        if self.sf_vec_size == 32:
+        # sf_dtype==E8M0 -> MXF4 atom (E8M0); else NVF4 (E4M3, any sf_vec_size).
+        # Both share MMA shape (16,8,64); only sf_dtype/sf_vec_size differ.
+        if self.sf_dtype == cutlass.Float8E8M0FNU:
             mma_op = cute.nvgpu.warp.MmaMXF4Op(
                 self.a_dtype,
                 self.acc_dtype,

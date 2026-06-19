@@ -139,6 +139,10 @@ _SM120_MOE_QUANT_MODE_ALIASES = {
     "mxfp4": "mxfp4",
     "bf16": "w4a16",
     "w4a16": "w4a16",
+    # NVFP4 with 32-element E4M3 block scales (e.g. Nvidia DeepSeek-V4-Flash-NVFP4
+    # checkpoint MoE experts use 32-block E4M3 rather than the standard 16-block).
+    "nvfp4_sf32": "nvfp4_sf32",
+    "nvfp4-32": "nvfp4_sf32",
 }
 
 
@@ -171,19 +175,23 @@ def _normalize_quant_mode(
         return _SM120_MOE_QUANT_MODE_ALIASES[normalized]
     except KeyError as exc:
         raise ValueError(
-            f"quant_mode must be 'nvfp4'/'w4a4', 'mxfp4', or 'w4a16' "
-            f"(got {quant_mode!r})."
+            f"quant_mode must be 'nvfp4'/'w4a4', 'nvfp4-32'/'nvfp4_sf32', "
+            f"'mxfp4', or 'w4a16' (got {quant_mode!r})."
         ) from exc
 
 
 def _sf_params_for_quant_mode(quant_mode: str):
     """(sf_vec_size, sf_dtype, block_size) for an FP4 dispatch mode.
 
-    NVFP4: 16-element E4M3 block scales.  MXFP4: 32-element E8M0 block scales.
+    NVFP4: 16-element E4M3 block scales.
+    NVFP4-SF32: 32-element E4M3 block scales (e.g. Nvidia DSv4-Flash-NVFP4 MoE).
+    MXFP4: 32-element E8M0 block scales.
     """
     mode = _normalize_quant_mode(quant_mode)
     if mode == "mxfp4":
         return 32, cutlass.Float8E8M0FNU, 32
+    if mode == "nvfp4_sf32":
+        return 32, cutlass.Float8E4M3FN, 32
     return 16, cutlass.Float8E4M3FN, _NVFP4_BLOCK_SIZE
 
 

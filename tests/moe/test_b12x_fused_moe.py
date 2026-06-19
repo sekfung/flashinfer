@@ -1263,6 +1263,66 @@ class TestB12xMXFP4Functional:
         )
 
 
+    @pytest.mark.parametrize(
+        "num_tokens,top_k", [(8, 1), (128, 1), (768, 1)]
+    )
+    def test_nvfp4_sf32_numerical_accuracy(self, num_tokens, top_k):
+        """NVFP4 with 32-element E4M3 block scales vs full-precision reference."""
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fp4_quantization import fp4_quantize
+        from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+
+        HID, INTER, E = 512, 1024, 8
+        dev = torch.device("cuda")
+
+        gs = torch.ones(1, device=dev, dtype=torch.float32)
+        w1_bf16 = torch.randn(E, 2 * INTER, HID, dtype=torch.bfloat16, device=dev) / 10
+        w1q_flat, w1sf_flat = fp4_quantize(
+            w1_bf16.reshape(E * 2 * INTER, HID), global_scale=gs,
+            sf_vec_size=32, sf_use_ue8m0=False, is_sf_swizzled_layout=True,
+        )
+        w1_sf = convert_sf_to_mma_layout(w1sf_flat, m=2 * INTER, k=HID, num_groups=E, sf_vec_size=32)
+
+        w2_bf16 = torch.randn(E, HID, INTER, dtype=torch.bfloat16, device=dev) / 10
+        w2q_flat, w2sf_flat = fp4_quantize(
+            w2_bf16.reshape(E * HID, INTER), global_scale=gs,
+            sf_vec_size=32, sf_use_ue8m0=False, is_sf_swizzled_layout=True,
+        )
+        w2_sf = convert_sf_to_mma_layout(w2sf_flat, m=HID, k=INTER, num_groups=E, sf_vec_size=32)
+
+        alpha = torch.ones(E, device=dev, dtype=torch.float32)
+        fc2_scale = torch.ones(1, device=dev, dtype=torch.float32)
+
+        x = torch.randn(num_tokens, HID, dtype=torch.bfloat16, device=dev) / 10
+        logits = torch.randn(num_tokens, E, device=dev)
+        tw, tid = torch.topk(torch.softmax(logits, -1), top_k, -1)
+        tw = (tw / tw.sum(-1, keepdim=True)).float()
+
+        result = b12x_fused_moe(
+            x=x, w1_weight=w1q_flat.view(E, 2*INTER, HID//2), w1_weight_sf=w1_sf,
+            w2_weight=w2q_flat.view(E, HID, INTER//2), w2_weight_sf=w2_sf,
+            token_selected_experts=tid.to(torch.int32), token_final_scales=tw,
+            num_experts=E, top_k=top_k, w1_alpha=alpha, w2_alpha=alpha,
+            fc2_input_scale=fc2_scale, num_local_experts=E,
+            activation="silu", quant_mode="nvfp4_sf32",
+        )
+        assert result.shape == (num_tokens, HID)
+        assert not torch.isnan(result).any()
+
+        ref = torch.zeros(num_tokens, HID, dtype=torch.float32, device=dev)
+        for t in range(num_tokens):
+            for k in range(top_k):
+                eid, rw = int(tid[t, k].item()), tw[t, k].item()
+                o = x[t] @ w1_bf16[eid].T
+                sg = torch.sigmoid(o[INTER:]) * o[INTER:] * o[:INTER]
+                ref[t] += rw * (sg @ w2_bf16[eid].T)
+
+        out_scale = max(ref.std().item(), 0.01)
+        atol = max(0.05, 1.5 * out_scale)
+        ok = torch.isclose(result.float(), ref, atol=atol, rtol=0.5).float().mean()
+        assert ok > 0.90, f"nvfp4_sf32 accuracy {ok:.3f} below threshold (atol={atol:.3f})"
+
+
 @cute_dsl_available
 @sm120_required
 @cuda_13_required

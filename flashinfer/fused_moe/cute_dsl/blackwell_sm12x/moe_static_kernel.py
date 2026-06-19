@@ -500,7 +500,7 @@ class MoEStaticKernel:
 
         # sf_vec_size==32 selects the MXF4 atom (E8M0 32-block scales);
         # else the NVF4 atom (E4M3 16-block). Same MMA shape (16,8,64).
-        if self.sf_vec_size == 32:
+        if self.sf_dtype == cutlass.Float8E8M0FNU:
             mma_op = cute.nvgpu.warp.MmaMXF4Op(
                 self.a_dtype,
                 self.acc_dtype,
@@ -1075,7 +1075,7 @@ class MoEStaticKernel:
             # Each FP4 block is independent — perfect parallelism. NVF4 uses
             # 16-element blocks + per-expert global scale; MXF4 uses 32-element
             # blocks + self-scaling E8M0 (no global scale).
-            if cutlass.const_expr(self.sf_vec_size == 32):
+            if cutlass.const_expr(self.sf_dtype == cutlass.Float8E8M0FNU):
                 sf_idx = Int32(tidx)
                 while sf_idx < sf_blocks_per_row:
                     block_start = sf_idx * Int32(32)
@@ -1829,7 +1829,7 @@ class MoEStaticKernel:
                 # MXF4 (sf_vec_size==32) uses 32-element scale blocks + self-
                 # scaling E8M0 (no global scale); NVF4 uses 16 + global scale.
                 sf_blocks_per_row = Int32(self.tile_shape_mnk[2] // self.sf_vec_size)
-                if cutlass.const_expr(self.sf_vec_size != 32):
+                if cutlass.const_expr(self.sf_dtype != cutlass.Float8E8M0FNU):
                     gs_value = global_scale[weight_expert_idx].to(cutlass.Float32)
                     if self.input_scales_are_reciprocal and gs_value != cutlass.Float32(
                         0.0
@@ -1900,7 +1900,7 @@ class MoEStaticKernel:
                         row = sa_row_base + rows_offset + local_row
                         sf_block = quant_idx - local_row * sf_blocks_per_row
 
-                        if cutlass.const_expr(self.sf_vec_size == 32):
+                        if cutlass.const_expr(self.sf_dtype == cutlass.Float8E8M0FNU):
                             block_start = sf_block * Int32(32)
                             values = cute.make_rmem_tensor((32,), cutlass.Float32)
                             block_max = cutlass.Float32(0.0)
